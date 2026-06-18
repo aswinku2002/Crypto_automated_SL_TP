@@ -13,7 +13,6 @@ API_KEY = os.environ.get('DELTA_API_KEY')
 API_SECRET = os.environ.get('DELTA_API_SECRET')
 # Use testnet for safety, set to 'https://api.delta.exchange' for production
 BASE_URL = os.environ.get('DELTA_BASE_URL', 'https://testnet-api.delta.exchange')
-SYMBOL = os.environ.get('DELTA_SYMBOL', 'BTCUSD')  # e.g., 'BTCUSD', 'ETHUSD'
 ATR_PERIOD = 14
 TIMEFRAME = '15m'  # 15-minute candle
 CHECK_INTERVAL = 60  # seconds
@@ -23,8 +22,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Initialize Delta Client ---
-# The delta-rest-client library might have a different import structure.
-# If the following fails, you may need to adjust the import based on the library's docs.
 try:
     delta_client = DeltaRestClient(
         base_url=BASE_URL,
@@ -34,36 +31,30 @@ try:
     logger.info("Delta client initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize Delta client: {e}")
-    # The app will still start, but the bot thread will fail.
     delta_client = None
 
-# --- Core Function: Calculate ATR ---
-def calculate_atr():
-    """Fetches 15-minute klines and calculates the ATR(14)."""
+# --- Core Function: Calculate ATR for ANY symbol ---
+def calculate_atr(symbol):
+    """Fetches 15-minute klines and calculates the ATR(14) for any symbol."""
     if delta_client is None:
         logger.error("Delta client not available.")
         return None
 
     try:
-        # Fetch the last (ATR_PERIOD + 1) 15-minute candles.
-        # The 'resolution' parameter is in minutes.
-        response = delta_client.get_klines(symbol=SYMBOL, resolution=15, limit=ATR_PERIOD + 1)
+        # Fetch the last (ATR_PERIOD + 1) 15-minute candles
+        response = delta_client.get_klines(symbol=symbol, resolution=15, limit=ATR_PERIOD + 1)
 
-        # The structure of the response can vary. Adapt this based on the actual output.
-        # It is often a list of lists: [ [timestamp, open, high, low, close, volume], ... ]
-        # Or a list of dicts. The logic below assumes a list of lists or dicts.
+        # Parse the response
         if isinstance(response, list) and len(response) > 0:
             if isinstance(response[0], list):
-                # If it's a list of lists
                 df = pd.DataFrame(response, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             elif isinstance(response[0], dict):
-                # If it's a list of dicts
                 df = pd.DataFrame(response)
             else:
-                logger.error("Unexpected data format from get_klines.")
+                logger.error(f"Unexpected data format from get_klines for {symbol}.")
                 return None
         else:
-            logger.error("Could not parse klines data.")
+            logger.error(f"Could not parse klines data for {symbol}.")
             return None
 
         # Ensure columns are numeric
@@ -78,24 +69,61 @@ def calculate_atr():
         df['tr3'] = (df['low'] - df['prev_close']).abs()
         df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
 
-        # Calculate ATR using Wilder's smoothing (EMA with alpha=1/period)
-        # Drop the first row which will have NaN for TR
+        # Calculate ATR using Wilder's smoothing
         df = df.dropna()
         if len(df) < ATR_PERIOD:
-             logger.warning(f"Not enough data to calculate ATR for period {ATR_PERIOD}. Have {len(df)} rows.")
+             logger.warning(f"Not enough data to calculate ATR for {symbol}. Have {len(df)} rows.")
              return None
 
         atr = df['TR'].ewm(alpha=1/ATR_PERIOD, adjust=False).mean().iloc[-1]
-        logger.info(f"Calculated ATR({ATR_PERIOD}) on {TIMEFRAME} chart: {atr}")
+        logger.info(f"Calculated ATR({ATR_PERIOD}) for {symbol}: {atr}")
         return atr
 
     except Exception as e:
-        logger.error(f"Error calculating ATR: {e}")
+        logger.error(f"Error calculating ATR for {symbol}: {e}")
         return None
+
+# --- Core Function: Check if SL/TP Orders Already Exist ---
+def orders_already_exist(symbol, side, sl_price, tp_price):
+    """Check if SL and TP orders already exist for this position."""
+    try:
+        open_orders = delta_client.get_orders()
+        if not open_orders:
+            return False
+        
+        sl_exists = False
+        tp_exists = False
+        
+        for order in open_orders:
+            order_symbol = order.get('product_symbol') or order.get('symbol')
+            if order_symbol != symbol:
+                continue
+            
+            order_side = order.get('side')
+            order_type = order.get('order_type')
+            order_price = float(order.get('price', 0))
+            
+            # Check for Stop Loss order (opposite side)
+            if order_side == ('SELL' if side == 'BUY' else 'BUY'):
+                if 'stop' in order_type.lower():
+                    # Check if the stop price is close to our calculated SL
+                    stop_price = float(order.get('stop_price', 0))
+                    if abs(stop_price - sl_price) < 0.01:  # Small tolerance
+                        sl_exists = True
+                # Check for Take Profit order (limit order)
+                elif 'limit' in order_type.lower():
+                    if abs(order_price - tp_price) < 0.01:  # Small tolerance
+                        tp_exists = True
+        
+        return sl_exists and tp_exists
+        
+    except Exception as e:
+        logger.error(f"Error checking existing orders: {e}")
+        return False
 
 # --- Core Function: Manage Positions ---
 def manage_positions():
-    """Fetches open positions and sets SL/TP if they are missing."""
+    """Fetches ALL open positions and sets SL/TP for each one."""
     if delta_client is None:
         return
 
@@ -106,14 +134,13 @@ def manage_positions():
             logger.info("No open positions found.")
             return
 
+        processed_count = 0
         for position in positions:
-            # Check if position is for our symbol and has size
-            # The symbol might be in a field like 'product_symbol' or 'symbol'
-            # Adjust based on the actual response structure.
+            # Get position details
             pos_symbol = position.get('product_symbol') or position.get('symbol')
-            if pos_symbol != SYMBOL:
+            if not pos_symbol:
                 continue
-
+                
             size = float(position.get('size', 0))
             if size == 0:
                 continue
@@ -125,12 +152,12 @@ def manage_positions():
 
             # Determine side
             side = 'BUY' if size > 0 else 'SELL'
-            logger.info(f"Found open position: {side} {abs(size)} {SYMBOL} @ {entry_price}")
+            logger.info(f"Found open position: {side} {abs(size)} {pos_symbol} @ {entry_price}")
 
-            # Calculate ATR
-            atr_value = calculate_atr()
+            # Calculate ATR for this specific symbol
+            atr_value = calculate_atr(pos_symbol)
             if atr_value is None:
-                logger.warning("Skipping position management due to ATR calculation failure.")
+                logger.warning(f"Skipping {pos_symbol} due to ATR calculation failure.")
                 continue
 
             # Calculate SL and TP prices
@@ -141,42 +168,47 @@ def manage_positions():
                 stop_loss_price = entry_price + (2 * atr_value)
                 take_profit_price = entry_price - (1.5 * atr_value)
 
-            logger.info(f"Calculated levels for {side}: SL={stop_loss_price}, TP={take_profit_price}")
+            logger.info(f"Calculated levels for {pos_symbol} {side}: SL={stop_loss_price:.2f}, TP={take_profit_price:.2f}")
+
+            # Check if orders already exist
+            if orders_already_exist(pos_symbol, side, stop_loss_price, take_profit_price):
+                logger.info(f"SL/TP orders already exist for {pos_symbol}. Skipping.")
+                continue
 
             # --- PLACE THE ORDERS ---
-            # This is a critical part. You need to check if SL/TP orders already exist
-            # to avoid duplication. The logic for this is highly dependent on the API.
-            # This is a simplified placeholder.
             try:
-                # Place a STOP order for Stop Loss
-                # The order type 'stop_market' or 'stop_limit' can be used.
-                # The 'stop_price' is the trigger price.
-                # The actual implementation depends on the delta-rest-client version.
-                logger.info("Attempting to place Stop-Loss order...")
+                # Place Stop Loss order
+                logger.info(f"Placing Stop-Loss for {pos_symbol}...")
                 # sl_order = delta_client.place_order(
-                #     symbol=SYMBOL,
+                #     symbol=pos_symbol,
                 #     side='SELL' if side == 'BUY' else 'BUY',
                 #     order_type='stop_market',
                 #     size=abs(size),
                 #     stop_price=stop_loss_price
                 # )
-                # logger.info(f"Stop-Loss order placed: {sl_order}")
+                # logger.info(f"Stop-Loss placed: {sl_order}")
 
-                # Place a LIMIT order for Take Profit
-                logger.info("Attempting to place Take-Profit order...")
+                # Place Take Profit order
+                logger.info(f"Placing Take-Profit for {pos_symbol}...")
                 # tp_order = delta_client.place_order(
-                #     symbol=SYMBOL,
+                #     symbol=pos_symbol,
                 #     side='SELL' if side == 'BUY' else 'BUY',
                 #     order_type='limit',
                 #     size=abs(size),
                 #     limit_price=take_profit_price
                 # )
-                # logger.info(f"Take-Profit order placed: {tp_order}")
-                logger.info("Order placement simulated. Uncomment and adapt the `place_order` calls.")
-                break # Process one position at a time for simplicity
+                # logger.info(f"Take-Profit placed: {tp_order}")
+                
+                logger.info(f"Order placement simulated for {pos_symbol}. Uncomment `place_order` calls.")
+                processed_count += 1
 
             except Exception as e:
-                logger.error(f"Failed to place orders for position {position.get('id')}: {e}")
+                logger.error(f"Failed to place orders for {pos_symbol}: {e}")
+
+        if processed_count > 0:
+            logger.info(f"Processed {processed_count} positions.")
+        else:
+            logger.info("No new positions needed SL/TP setup.")
 
     except Exception as e:
         logger.error(f"Error in position management loop: {e}")
@@ -184,7 +216,7 @@ def manage_positions():
 # --- Bot Thread Function ---
 def bot_worker():
     """The main loop for the trading bot."""
-    logger.info("Bot worker thread started.")
+    logger.info("Bot worker thread started - monitoring ALL positions.")
     while True:
         try:
             manage_positions()
@@ -197,23 +229,29 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return jsonify({"status": "running", "message": f"Delta bot for {SYMBOL} is active."})
+    return jsonify({
+        "status": "running", 
+        "message": "Delta bot is monitoring ALL positions across ALL currencies.",
+        "check_interval": f"{CHECK_INTERVAL} seconds"
+    })
 
 @app.route('/status')
 def status():
-    # Placeholder for a more detailed status endpoint
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "atr_period": ATR_PERIOD,
+        "timeframe": TIMEFRAME
+    })
 
 # --- Entrypoint for Render ---
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         logger.error("API Key or Secret not set. Please set DELTA_API_KEY and DELTA_API_SECRET environment variables.")
     else:
-        # Start the bot in a background thread so the Flask app can run.
+        # Start the bot in a background thread
         bot_thread = threading.Thread(target=bot_worker, daemon=True)
         bot_thread.start()
-        logger.info("Bot thread started.")
+        logger.info("Bot thread started - monitoring ALL trading pairs.")
 
     port = int(os.environ.get("PORT", 10000))
-    # Run the Flask app. Render expects the app to listen on 0.0.0.0
     app.run(host="0.0.0.0", port=port)
