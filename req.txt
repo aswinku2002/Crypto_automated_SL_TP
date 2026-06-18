@@ -1,0 +1,5 @@
+flask
+delta-rest-client
+pandas
+requests
+gunicorn
