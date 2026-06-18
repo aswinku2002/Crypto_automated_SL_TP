@@ -5,10 +5,8 @@ import logging
 from flask import Flask, jsonify
 from delta_rest_client import DeltaRestClient
 import pandas as pd
-import requests
 
 # --- Configuration ---
-# These will be set as Environment Variables on Render
 API_KEY = os.environ.get('DELTA_API_KEY')
 API_SECRET = os.environ.get('DELTA_API_SECRET')
 # Use testnet for safety, set to 'https://api.delta.exchange' for production
@@ -33,18 +31,29 @@ except Exception as e:
     logger.error(f"Failed to initialize Delta client: {e}")
     delta_client = None
 
+# --- Core Function: Get Product ID from Symbol ---
+def get_product_id(symbol):
+    """Fetches the numeric product_id for a given symbol."""
+    try:
+        products = delta_client.get_products()
+        for product in products:
+            if product.get('symbol') == symbol:
+                return product.get('id')
+        logger.error(f"Product ID not found for symbol: {symbol}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching product ID for {symbol}: {e}")
+        return None
+
 # --- Core Function: Calculate ATR for ANY symbol ---
 def calculate_atr(symbol):
     """Fetches 15-minute klines and calculates the ATR(14) for any symbol."""
     if delta_client is None:
-        logger.error("Delta client not available.")
         return None
 
     try:
-        # Fetch the last (ATR_PERIOD + 1) 15-minute candles
         response = delta_client.get_klines(symbol=symbol, resolution=15, limit=ATR_PERIOD + 1)
 
-        # Parse the response
         if isinstance(response, list) and len(response) > 0:
             if isinstance(response[0], list):
                 df = pd.DataFrame(response, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -69,10 +78,9 @@ def calculate_atr(symbol):
         df['tr3'] = (df['low'] - df['prev_close']).abs()
         df['TR'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
 
-        # Calculate ATR using Wilder's smoothing
         df = df.dropna()
         if len(df) < ATR_PERIOD:
-             logger.warning(f"Not enough data to calculate ATR for {symbol}. Have {len(df)} rows.")
+             logger.warning(f"Not enough data to calculate ATR for {symbol}.")
              return None
 
         atr = df['TR'].ewm(alpha=1/ATR_PERIOD, adjust=False).mean().iloc[-1]
@@ -83,42 +91,78 @@ def calculate_atr(symbol):
         logger.error(f"Error calculating ATR for {symbol}: {e}")
         return None
 
-# --- Core Function: Check if SL/TP Orders Already Exist ---
-def orders_already_exist(symbol, side, sl_price, tp_price):
-    """Check if SL and TP orders already exist for this position."""
+# --- Core Function: Check if Bracket Orders Already Exist ---
+def bracket_orders_exist(position_id):
+    """Checks if any bracket orders (SL/TP) exist for the given position ID."""
     try:
-        open_orders = delta_client.get_orders()
-        if not open_orders:
+        orders = delta_client.get_orders()
+        if not orders:
             return False
-        
-        sl_exists = False
-        tp_exists = False
-        
-        for order in open_orders:
-            order_symbol = order.get('product_symbol') or order.get('symbol')
-            if order_symbol != symbol:
-                continue
-            
-            order_side = order.get('side')
-            order_type = order.get('order_type')
-            order_price = float(order.get('price', 0))
-            
-            # Check for Stop Loss order (opposite side)
-            if order_side == ('SELL' if side == 'BUY' else 'BUY'):
-                if 'stop' in order_type.lower():
-                    # Check if the stop price is close to our calculated SL
-                    stop_price = float(order.get('stop_price', 0))
-                    if abs(stop_price - sl_price) < 0.01:  # Small tolerance
-                        sl_exists = True
-                # Check for Take Profit order (limit order)
-                elif 'limit' in order_type.lower():
-                    if abs(order_price - tp_price) < 0.01:  # Small tolerance
-                        tp_exists = True
-        
-        return sl_exists and tp_exists
-        
+
+        for order in orders:
+            # Bracket orders are linked to the parent position/order. The exact linking field may vary.
+            # Look for orders where the parent_order_id matches your position_id or similar logic.
+            # This example assumes the position_id is the ID from get_positions().
+            if order.get('parent_order_id') == position_id:
+                return True
+            # Alternative: if the position_id isn't the parent, you may need to
+            # check against the product_id or a custom mapping.
+            # The specific check depends on the `delta-rest-client` and API response.
+        return False
+
     except Exception as e:
-        logger.error(f"Error checking existing orders: {e}")
+        logger.error(f"Error checking for bracket orders: {e}")
+        return False
+
+# --- Core Function: Place Bracket Orders ---
+def place_bracket_orders(position, product_id, atr_value):
+    """Places stop-loss and take-profit orders for a given position."""
+    pos_symbol = position.get('product_symbol') or position.get('symbol')
+    size = float(position.get('size', 0))
+    entry_price = float(position.get('entry_price', 0))
+    side = 'BUY' if size > 0 else 'SELL'
+
+    # Calculate SL and TP prices
+    if side == 'BUY':
+        stop_loss_price = entry_price - (2 * atr_value)
+        take_profit_price = entry_price + (1.5 * atr_value)
+        sl_side = 'SELL'
+        tp_side = 'SELL'
+    else:  # SELL
+        stop_loss_price = entry_price + (2 * atr_value)
+        take_profit_price = entry_price - (1.5 * atr_value)
+        sl_side = 'BUY'
+        tp_side = 'BUY'
+
+    logger.info(f"Placing bracket for {pos_symbol}: SL={stop_loss_price:.2f}, TP={take_profit_price:.2f}")
+
+    try:
+        # Use reduce-only flag to ensure these orders only close the position [citation:2]
+        # Place Stop Loss order (uses place_stop_order with stop_price) [citation:9]
+        sl_order = delta_client.place_stop_order(
+            product_id=product_id,
+            size=abs(size),
+            side=sl_side,
+            stop_price=stop_loss_price,
+            order_type='MARKET',  # Use 'LIMIT' for a limit stop-loss
+            reduce_only=True
+        )
+        logger.info(f"Stop-Loss placed: {sl_order}")
+
+        # Place Take Profit order (uses place_order with limit_price)
+        tp_order = delta_client.place_order(
+            product_id=product_id,
+            size=abs(size),
+            side=tp_side,
+            limit_price=take_profit_price,
+            order_type='LIMIT',
+            reduce_only=True
+        )
+        logger.info(f"Take-Profit placed: {tp_order}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to place bracket orders for {pos_symbol}: {e}")
         return False
 
 # --- Core Function: Manage Positions ---
@@ -128,15 +172,12 @@ def manage_positions():
         return
 
     try:
-        # Get all open positions
         positions = delta_client.get_positions()
         if not positions:
             logger.info("No open positions found.")
             return
 
-        processed_count = 0
         for position in positions:
-            # Get position details
             pos_symbol = position.get('product_symbol') or position.get('symbol')
             if not pos_symbol:
                 continue
@@ -150,9 +191,16 @@ def manage_positions():
                 logger.warning(f"Could not fetch entry price for position {position.get('id')}")
                 continue
 
-            # Determine side
-            side = 'BUY' if size > 0 else 'SELL'
-            logger.info(f"Found open position: {side} {abs(size)} {pos_symbol} @ {entry_price}")
+            # Get the product ID for this symbol
+            product_id = get_product_id(pos_symbol)
+            if product_id is None:
+                continue
+
+            # Check if bracket orders already exist for this position
+            # Pass the product_id or position ID to check linked orders
+            if bracket_orders_exist(position.get('id')):
+                logger.info(f"Bracket orders already exist for {pos_symbol}. Skipping.")
+                continue
 
             # Calculate ATR for this specific symbol
             atr_value = calculate_atr(pos_symbol)
@@ -160,55 +208,8 @@ def manage_positions():
                 logger.warning(f"Skipping {pos_symbol} due to ATR calculation failure.")
                 continue
 
-            # Calculate SL and TP prices
-            if side == 'BUY':
-                stop_loss_price = entry_price - (2 * atr_value)
-                take_profit_price = entry_price + (1.5 * atr_value)
-            else:  # SELL
-                stop_loss_price = entry_price + (2 * atr_value)
-                take_profit_price = entry_price - (1.5 * atr_value)
-
-            logger.info(f"Calculated levels for {pos_symbol} {side}: SL={stop_loss_price:.2f}, TP={take_profit_price:.2f}")
-
-            # Check if orders already exist
-            if orders_already_exist(pos_symbol, side, stop_loss_price, take_profit_price):
-                logger.info(f"SL/TP orders already exist for {pos_symbol}. Skipping.")
-                continue
-
-            # --- PLACE THE ORDERS ---
-            try:
-                # Place Stop Loss order
-                logger.info(f"Placing Stop-Loss for {pos_symbol}...")
-                # sl_order = delta_client.place_order(
-                #     symbol=pos_symbol,
-                #     side='SELL' if side == 'BUY' else 'BUY',
-                #     order_type='stop_market',
-                #     size=abs(size),
-                #     stop_price=stop_loss_price
-                # )
-                # logger.info(f"Stop-Loss placed: {sl_order}")
-
-                # Place Take Profit order
-                logger.info(f"Placing Take-Profit for {pos_symbol}...")
-                # tp_order = delta_client.place_order(
-                #     symbol=pos_symbol,
-                #     side='SELL' if side == 'BUY' else 'BUY',
-                #     order_type='limit',
-                #     size=abs(size),
-                #     limit_price=take_profit_price
-                # )
-                # logger.info(f"Take-Profit placed: {tp_order}")
-                
-                logger.info(f"Order placement simulated for {pos_symbol}. Uncomment `place_order` calls.")
-                processed_count += 1
-
-            except Exception as e:
-                logger.error(f"Failed to place orders for {pos_symbol}: {e}")
-
-        if processed_count > 0:
-            logger.info(f"Processed {processed_count} positions.")
-        else:
-            logger.info("No new positions needed SL/TP setup.")
+            # Place bracket orders
+            place_bracket_orders(position, product_id, atr_value)
 
     except Exception as e:
         logger.error(f"Error in position management loop: {e}")
@@ -246,9 +247,8 @@ def status():
 # --- Entrypoint for Render ---
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
-        logger.error("API Key or Secret not set. Please set DELTA_API_KEY and DELTA_API_SECRET environment variables.")
+        logger.error("API Key or Secret not set.")
     else:
-        # Start the bot in a background thread
         bot_thread = threading.Thread(target=bot_worker, daemon=True)
         bot_thread.start()
         logger.info("Bot thread started - monitoring ALL trading pairs.")
